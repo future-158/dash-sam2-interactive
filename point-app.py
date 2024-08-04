@@ -1,5 +1,6 @@
 import base64
 import plotly.express as px
+import cv2
 from sklearn.preprocessing import minmax_scale
 import pandas as pd
 from io import BytesIO
@@ -15,19 +16,52 @@ import plotly.express as px
 from dash import Input, Output, State, dcc, html
 from PIL import Image
 from diffusers.utils import load_image
-
-# ds = fo.load_dataset('magna-style-real-caption')
-
-
-
 from types import SimpleNamespace
+import random
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+os.environ['TORCH_CUDNN_SDPA_ENABLED']='1'
+
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+
+
+
 st = SimpleNamespace()
 st.session_state = {}
 
+# use bfloat16 for the entire notebook
+torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+
+
+if torch.cuda.get_device_properties(0).major >= 8:
+    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+sam2_checkpoint = "/workspace/provision/models/sam2_hiera_tiny.pt"
+model_cfg = "sam2_hiera_t.yaml"
+sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
+predictor = SAM2ImagePredictor(sam2_model)
+# st.session_state['predictor'] = predictor
+
+
 
 def update():
-    img = load_image('https://images.pexels.com/photos/1806771/pexels-photo-1806771.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2')
+    urls = [
+        'https://images.pexels.com/photos/1806771/pexels-photo-1806771.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2',
+        'https://images.pexels.com/photos/1806771/pexels-photo-1806771.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2',
+        'https://images.pexels.com/photos/1806771/pexels-photo-1806771.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=2',
+    ]
+    url = random.choice(urls)
+    img = load_image(url)
     img.thumbnail((1280, 720))    
+    # st.session_state['predictor'].set_image(np.array(img))
     st.session_state['img'] = img
     st.session_state['pos'] = []
     st.session_state['neg'] = []
@@ -51,40 +85,11 @@ def pil_to_fig(image):
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
-    return fig
+    return fig.update_layout(dragmode='drawrect')
 
 
 # todo: update image button
 # todo: save image button
-
-
-fig = st.session_state['img']
-
-
-def show_mask(mask, ax, random_color=False, borders = True):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([30/255, 144/255, 255/255, 0.6])
-    h, w = mask.shape[-2:]
-    mask = mask.astype(np.uint8)
-    mask_image =  mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    if borders:
-        import cv2
-        contours, _ = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
-        # Try to smooth contours
-        contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
-        mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2) 
-    ax.imshow(mask_image)
-
-# input_point = np.array([[500, 375]])
-# input_label = np.array([1])
-
-
-
-# radio button
-
-
 
 def fig_to_pil(figure_data) -> Image.Image:
     # Decode plotly figure to an pillow image
@@ -99,7 +104,6 @@ def fig_to_pil(figure_data) -> Image.Image:
 # Initialize the Dash app
 app = dash.Dash(__name__)
 
-
 app.layout = html.Div([
     dcc.RadioItems(
         id = 'radio',
@@ -107,7 +111,7 @@ app.layout = html.Div([
             {'label': 'pos', 'value': 'pos'},
             {'label': 'neg', 'value': 'neg'},
         ],
-        value='MTL',
+        value='pos',
     ),
     dcc.Graph(id='graph-active', figure=pil_to_fig(st.session_state['img'])),
     # dcc.Graph(id='graph-responsive', figure=pil_to_fig(img_responsive)),
@@ -139,6 +143,7 @@ def display_click_data(clickData, figure_active, radio):
     else:
         st.session_state['neg'].append((x, y))
 
+
     pos = st.session_state['pos']
     neg = st.session_state['neg']
 
@@ -159,11 +164,75 @@ def display_click_data(clickData, figure_active, radio):
         if label == 'pos':
             draw_circle(draw, (x, y), 10, 'green')
         else:
-            draw_circle(draw, (x, y), 10, 'red')
-        
-
+            draw_circle(draw, (x, y), 10, 'red')        
     return json.dumps(clickData, indent=2), pil_to_fig(img)
 
 
+@app.callback(
+    Output('graph-active', 'figure', allow_duplicate=True),
+    Input('graph-active', 'relayoutData'),
+    State('graph-active', 'figure'),
+    prevent_initial_call=True   
+)
+def update_graph(relayout_data, figure_data):
+    if "shapes" in relayout_data:
+        shape = relayout_data["shapes"][-1]
+        # print(shape)
+
+        x0, y0, x1, y1 = map(int, (shape["x0"], shape["y0"], shape["x1"], shape["y1"]))
+
+    
+        pos = st.session_state['pos']
+        neg = st.session_state['neg']
+
+        points = pos + neg
+        labels = [1]*len(st.session_state['pos']) + [0]*len(st.session_state['neg'])
+
+
+        input_box = np.array([x0, y0, x1, y1])
+        input_point = np.array(points) if len(points) else None
+        input_label = np.array(labels) if len(labels) else None
+
+        # print(input_box, input_point, input_label)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            predictor.set_image(np.array(st.session_state['img']))
+            masks, _, _ = predictor.predict(
+                point_coords=input_point,
+                point_labels=input_label,
+                box=input_box,
+                multimask_output=False,
+            )
+            
+        mask = masks[0] > 0    
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+
+        h, w = mask.shape
+        mask = mask.astype(np.uint8)
+        mask_image =  mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+
+        
+        contours, _ = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
+        contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
+        mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2) 
+        mask_image = (mask_image * 255).astype(np.uint8)
+        st.session_state['mask_image'] = mask_image
+        
+        seg_img = Image.fromarray(mask_image)
+        img = st.session_state['img'].copy()
+        new_img = Image.alpha_composite(img.convert('RGBA'), seg_img).convert('RGB')
+        # img.paste((255, 0, 0), (x0, y0, x1, y1))
+        return px.imshow(new_img).update_layout(dragmode='drawrect')
+    else:
+        raise dash.exceptions.PreventUpdate
+
 if __name__ == '__main__':
-    app.run_server(debug=True, port=8052)
+    app.run_server(debug=True)
+
+
+
+
+
+
+
+
+
