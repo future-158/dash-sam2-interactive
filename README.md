@@ -1,3 +1,6 @@
+
+[README ENGLISH](README_en.md)
+
 # introduction
 ![Demo](assets/easy.gif)
 
