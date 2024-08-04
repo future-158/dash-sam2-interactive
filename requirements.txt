@@ -1,0 +1,4 @@
+diffusers
+dash
+plotly-express
+opencv-python
